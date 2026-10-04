@@ -1,0 +1,230 @@
+#!/usr/bin/env bash
+# rgb-theme: switch the RGB desktop look on or off.
+#
+#   cursor   Bibata-RGB (animated rainbow)  <->  Bibata-Modern-Ice
+#   borders  rainbow window borders (~/.config/hypr/config/rgb.lua)
+#            <->  the colours in ~/.config/hypr/config/decorations.lua
+#
+# usage: rgb-theme on|off|toggle|status [all|cursor|borders]
+#        rgb-theme spin loop|focus|off    how the rainbow borders move:
+#            loop   turn all the time (Hyprland then redraws the screen at its refresh rate)
+#            focus  turn once whenever a window gets focus
+#            off    stand still
+#
+# "off" puts every file it touches back as it was. Apps that are already running, and the
+# XWayland root cursor, pick up a cursor change at the next login. With spin loop, windows
+# opened while the borders did not move (borders off, or spin off) keep turning only after
+# they are reopened (or after the next login); until then they turn once per focus change.
+
+set -euo pipefail
+
+RGB_CURSOR=Bibata-RGB
+ORIG_CURSOR=Bibata-Modern-Ice
+
+CONF=${XDG_CONFIG_HOME:-$HOME/.config}
+UWSM_ENV=$CONF/uwsm/env
+GTK3=$CONF/gtk-3.0/settings.ini
+XSETTINGSD=$CONF/xsettingsd/xsettingsd.conf
+ICONS_DEFAULT=$HOME/.icons/default/index.theme
+HYPR_MAIN=$CONF/hypr/hyprland.lua
+RGB_MODULE=$CONF/hypr/config/rgb.lua
+REQUIRE_LINE='require("config.rgb")'
+ANCHOR_LINE='require("config.workspaces")'
+
+die() { echo "rgb-theme: $*" >&2; exit 1; }
+warn() { echo "rgb-theme: $*" >&2; }
+have_hypr() { [[ -n ${HYPRLAND_INSTANCE_SIGNATURE:-} ]] && command -v hyprctl >/dev/null; }
+
+usage() {
+    # the comment block at the top of this file, up to the first non-comment line
+    sed -n '2,/^[^#]/{/^#/s/^# \{0,1\}//p}' "$0"
+}
+
+theme_dir() {
+    local d
+    for d in "$HOME/.local/share/icons/$1" "$HOME/.icons/$1" "/usr/share/icons/$1"; do
+        [[ -d $d ]] && { echo "$d"; return 0; }
+    done
+    return 1
+}
+
+# Value of `export NAME=value` in the uwsm env file, with or without quotes
+env_value() {
+    [[ -r $UWSM_ENV ]] || return 0
+    sed -n -E "s/^[[:space:]]*export[[:space:]]+$1=[\"']?([^\"'[:space:]#]*).*/\\1/p" "$UWSM_ENV" | head -n1 || true
+}
+
+current_cursor() {
+    local c
+    c=$(env_value HYPRCURSOR_THEME)
+    # no uwsm line: fall back to what GTK is set to
+    if [[ -z $c && -r $GTK3 ]]; then
+        c=$(sed -n -E 's/^[[:space:]]*gtk-cursor-theme-name[[:space:]]*=[[:space:]]*([^[:space:]]+).*/\1/p' "$GTK3" | head -n1 || true)
+    fi
+    echo "$c"
+}
+
+cursor_size() {
+    local s
+    s=$(env_value HYPRCURSOR_SIZE)
+    echo "${s:-24}"
+}
+
+set_cursor() {
+    local theme=$1 size reply
+    size=$(cursor_size)
+
+    # Only the value is replaced; quoting and anything after it stay as they were.
+    # Session environment for apps started after the next login:
+    if [[ ! -f $UWSM_ENV ]]; then
+        warn "$UWSM_ENV is missing: the cursor applies now, but the next login uses whatever theme the session sets"
+    elif ! grep -qE '^[[:space:]]*export[[:space:]]+HYPRCURSOR_THEME=' "$UWSM_ENV"; then
+        warn "$UWSM_ENV has no 'export HYPRCURSOR_THEME=...' line: the cursor applies now, but the next login uses whatever theme the session sets"
+    fi
+    if [[ -f $UWSM_ENV ]]; then
+        sed -i --follow-symlinks -E "s/^([[:space:]]*export[[:space:]]+(HYPR|X)CURSOR_THEME=[\"']?)[^\"'[:space:]#]*/\\1$theme/" "$UWSM_ENV"
+    fi
+    # GTK3 and XWayland apps, and anything asking for the "default" theme:
+    if [[ -f $GTK3 ]]; then
+        sed -i --follow-symlinks -E "s/^([[:space:]]*gtk-cursor-theme-name[[:space:]]*=[[:space:]]*)[^[:space:]]*/\\1$theme/" "$GTK3"
+    fi
+    if [[ -f $XSETTINGSD ]]; then
+        sed -i --follow-symlinks -E "s|^([[:space:]]*Gtk/CursorThemeName[[:space:]]+\")[^\"]*|\\1$theme|" "$XSETTINGSD"
+    fi
+    if [[ -f $ICONS_DEFAULT ]]; then
+        sed -i --follow-symlinks -E "s/^([[:space:]]*Inherits[[:space:]]*=[[:space:]]*)[^[:space:]]*/\\1$theme/" "$ICONS_DEFAULT"
+    fi
+    if command -v gsettings >/dev/null; then
+        gsettings set org.gnome.desktop.interface cursor-theme "$theme" || true
+    fi
+    if pgrep -x xsettingsd >/dev/null; then
+        pkill -HUP -x xsettingsd || true
+    fi
+
+    # The running session: apps launched from now on, and the compositor's own cursor
+    if command -v dbus-update-activation-environment >/dev/null; then
+        dbus-update-activation-environment --systemd "XCURSOR_THEME=$theme" "HYPRCURSOR_THEME=$theme" || true
+    else
+        systemctl --user set-environment "XCURSOR_THEME=$theme" "HYPRCURSOR_THEME=$theme" || true
+    fi
+    if have_hypr; then
+        hyprctl eval "hl.env(\"XCURSOR_THEME\", \"$theme\"); hl.env(\"HYPRCURSOR_THEME\", \"$theme\")" >/dev/null 2>&1 || true
+        reply=$(hyprctl setcursor "$theme" "$size" 2>&1 || true)
+        [[ $reply == ok ]] || warn "Hyprland did not switch the cursor now (${reply:-no reply}); it will at the next login"
+    fi
+    echo "cursor: $theme (size $size)"
+}
+
+borders_on() { [[ -f $HYPR_MAIN ]] && grep -qxF "$REQUIRE_LINE" "$HYPR_MAIN"; }
+
+reload_hypr() {
+    have_hypr || return 0
+    if ! hyprctl reload >/dev/null 2>&1; then
+        warn "could not reach Hyprland; the change applies at the next login"
+        return 0
+    fi
+    local errors
+    errors=$(hyprctl configerrors 2>/dev/null || true)
+    if [[ -n ${errors//[[:space:]]/} ]]; then
+        warn "Hyprland reports config errors:"
+        echo "$errors" >&2
+    fi
+}
+
+set_borders() {
+    local n
+    if [[ $1 == on ]]; then
+        if ! borders_on; then
+            n=$(awk -v line="$ANCHOR_LINE" '$0 == line { print NR; exit }' "$HYPR_MAIN")
+            if [[ -n $n ]]; then
+                sed -i --follow-symlinks "${n}a $REQUIRE_LINE" "$HYPR_MAIN"
+            else
+                # no anchor: append, after making sure the file ends with a newline
+                [[ -s $HYPR_MAIN && -n $(tail -c1 "$HYPR_MAIN") ]] && echo >>"$HYPR_MAIN"
+                printf '%s\n' "$REQUIRE_LINE" >>"$HYPR_MAIN"
+            fi
+        fi
+    else
+        # delete from the bottom up so earlier line numbers stay valid
+        for n in $(awk -v line="$REQUIRE_LINE" '$0 == line { print NR }' "$HYPR_MAIN" | sort -rn); do
+            sed -i --follow-symlinks "${n}d" "$HYPR_MAIN"
+        done
+    fi
+    reload_hypr
+    echo "borders: $1"
+}
+
+spin_mode() { sed -n -E 's/^local SPIN = "([a-z]+)".*/\1/p' "$RGB_MODULE" 2>/dev/null | head -n1; }
+
+set_spin() {
+    [[ -f $RGB_MODULE ]] || die "$RGB_MODULE not found (run install.sh)"
+    grep -qE '^local SPIN = "' "$RGB_MODULE" || die "$RGB_MODULE has no 'local SPIN = \"...\"' line"
+    sed -i --follow-symlinks -E "s/^(local SPIN = \")[^\"]*(\".*)/\\1$1\\2/" "$RGB_MODULE"
+    [[ $(spin_mode) == "$1" ]] || die "could not set SPIN in $RGB_MODULE"
+    if borders_on; then reload_hypr; fi
+    echo "spin: $1$(borders_on || echo ' (borders are off; used once they are on)')"
+}
+
+status() {
+    local c
+    c=$(current_cursor)
+    echo "cursor:  ${c:-?} (size $(cursor_size))$([[ $c == "$RGB_CURSOR" ]] && echo '  [RGB]')"
+    [[ -f $GTK3 ]] && echo "  gtk-3.0:     $(sed -n -E 's/^[[:space:]]*gtk-cursor-theme-name[[:space:]]*=[[:space:]]*//p' "$GTK3")"
+    [[ -f $XSETTINGSD ]] && echo "  xsettingsd:  $(sed -n -E 's|^[[:space:]]*Gtk/CursorThemeName[[:space:]]+||p' "$XSETTINGSD")"
+    [[ -f $ICONS_DEFAULT ]] && echo "  icons/default inherits: $(sed -n -E 's/^[[:space:]]*Inherits[[:space:]]*=[[:space:]]*//p' "$ICONS_DEFAULT")"
+    command -v gsettings >/dev/null && echo "  gsettings:   $(gsettings get org.gnome.desktop.interface cursor-theme 2>/dev/null || echo '?')"
+    echo "borders: $(borders_on && echo 'on  [RGB]' || echo off), spin: $(spin_mode || true)"
+    if have_hypr; then
+        local v
+        v=$(hyprctl getoption general:col:active_border 2>/dev/null) || v="? (could not reach Hyprland)"
+        echo "  active_border: ${v%%$'\n'*}"
+    fi
+    return 0
+}
+
+# Everything the requested change needs, checked before any file is touched
+preflight() {
+    local action=$1 what=$2
+    if [[ $what == all || $what == cursor ]]; then
+        local target=$ORIG_CURSOR
+        [[ $action == on ]] && target=$RGB_CURSOR
+        theme_dir "$target" >/dev/null || die "cursor theme $target is not installed"
+    fi
+    if [[ $what == all || $what == borders ]]; then
+        [[ -f $HYPR_MAIN ]] || die "$HYPR_MAIN not found"
+        [[ -w $HYPR_MAIN ]] || die "$HYPR_MAIN is not writable"
+        if [[ $action == on ]]; then
+            [[ -f $RGB_MODULE ]] || die "$RGB_MODULE not found (run install.sh)"
+        fi
+    fi
+}
+
+action=${1:-status}
+case $action in
+    -h | --help | help) usage; exit 0 ;;
+    status) status; exit 0 ;;
+    spin)
+        case ${2:-} in loop | focus | off) set_spin "$2"; exit 0 ;; *) die "usage: rgb-theme spin loop|focus|off" ;; esac
+        ;;
+    on | off | toggle) ;;
+    *) die "unknown action '$action' (on, off, toggle, status, spin; see --help)" ;;
+esac
+
+what=${2:-all}
+case $what in all | cursor | borders) ;; *) die "unknown part '$what' (all, cursor, borders)" ;; esac
+
+if [[ $action == toggle ]]; then
+    case $what in
+        cursor) if [[ $(current_cursor) == "$RGB_CURSOR" ]]; then action=off; else action=on; fi ;;
+        borders) if borders_on; then action=off; else action=on; fi ;;
+        all) if [[ $(current_cursor) == "$RGB_CURSOR" ]] || borders_on; then action=off; else action=on; fi ;;
+    esac
+fi
+
+preflight "$action" "$what"
+if [[ $what == all || $what == cursor ]]; then
+    if [[ $action == on ]]; then set_cursor "$RGB_CURSOR"; else set_cursor "$ORIG_CURSOR"; fi
+fi
+if [[ $what == all || $what == borders ]]; then
+    set_borders "$action"
+fi
