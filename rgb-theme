@@ -1,25 +1,35 @@
 #!/usr/bin/env bash
 # rgb-theme: switch the RGB desktop look on or off.
 #
-#   cursor   Bibata-RGB (animated rainbow)  <->  Bibata-Modern-Ice
+#   cursor   the Bibata-RGB cursor theme (animated rainbow)
 #   borders  rainbow window borders (~/.config/hypr/config/rgb.lua)
-#            <->  the colours in ~/.config/hypr/config/decorations.lua
 #
 # usage: rgb-theme on|off|toggle|status [all|cursor|borders]
-#        rgb-theme spin loop|focus|off    how the rainbow borders move:
+#        rgb-theme spin loop|focus|off      how the rainbow borders move:
 #            loop   turn all the time (Hyprland then redraws the screen at its refresh rate)
 #            focus  turn once whenever a window gets focus
 #            off    stand still
+#        rgb-theme speed                    show both speeds
+#        rgb-theme speed cursor <s>|default seconds per rainbow cycle of the cursor (0.3-20, default 2.16);
+#                                           the busy spinner turns faster or slower with it
+#        rgb-theme speed borders <s>|default seconds per turn of the borders (0.3-10, default 5)
+#        rgb-theme version
 #
-# "off" puts every file it touches back as it was. Apps that are already running, and the
-# XWayland root cursor, pick up a cursor change at the next login. With spin loop, windows
-# opened while the borders did not move (borders off, or spin off) keep turning only after
-# they are reopened (or after the next login); until then they turn once per focus change.
+# "on" first saves what it is about to change (~/.local/state/bibata-rgb), and "off" puts
+# exactly that back: the files, whether they existed, gsettings and the session environment.
+# A file edited by hand in between keeps those edits; only its cursor theme line goes back.
+# Apps that are already running, and the XWayland root cursor, pick up a cursor change at the
+# next login. With spin loop, windows opened while the borders did not move (borders off, or
+# spin off) keep turning only after they are reopened; until then they turn once per focus.
 
 set -euo pipefail
 
+VERSION=1.1.0
 RGB_CURSOR=Bibata-RGB
-ORIG_CURSOR=Bibata-Modern-Ice
+# what "off" switches to when there is no saved state (the look was switched on by 1.0)
+FALLBACK_CURSOR=Bibata-Modern-Ice
+DEFAULT_CYCLE_MS=2160
+DEFAULT_TURN=5
 
 CONF=${XDG_CONFIG_HOME:-$HOME/.config}
 UWSM_ENV=$CONF/uwsm/env
@@ -28,12 +38,17 @@ XSETTINGSD=$CONF/xsettingsd/xsettingsd.conf
 ICONS_DEFAULT=$HOME/.icons/default/index.theme
 HYPR_MAIN=$CONF/hypr/hyprland.lua
 RGB_MODULE=$CONF/hypr/config/rgb.lua
+RGB_THEME_DIR=$HOME/.local/share/icons/$RGB_CURSOR
+STATE=${XDG_STATE_HOME:-$HOME/.local/state}/bibata-rgb
 REQUIRE_LINE='require("config.rgb")'
 ANCHOR_LINE='require("config.workspaces")'
+GSCHEMA=org.gnome.desktop.interface
+CURSOR_KEYS=(uwsm-env gtk3-settings xsettingsd icons-default)
 
 die() { echo "rgb-theme: $*" >&2; exit 1; }
 warn() { echo "rgb-theme: $*" >&2; }
 have_hypr() { [[ -n ${HYPRLAND_INSTANCE_SIGNATURE:-} ]] && command -v hyprctl >/dev/null; }
+sha() { sha256sum <"$1" | cut -d' ' -f1; }
 
 usage() {
     # the comment block at the top of this file, up to the first non-comment line
@@ -48,71 +63,337 @@ theme_dir() {
     return 1
 }
 
-# Value of `export NAME=value` in the uwsm env file, with or without quotes
-env_value() {
+# ---------------------------------------------------------------------------------------
+# Where the cursor theme is set. A "key" is one file; a "slot" is one setting line in it.
+
+key_file() {
+    case $1 in
+        uwsm-env) echo "$UWSM_ENV" ;;
+        gtk3-settings) echo "$GTK3" ;;
+        xsettingsd) echo "$XSETTINGSD" ;;
+        icons-default) echo "$ICONS_DEFAULT" ;;
+        hyprland-lua) echo "$HYPR_MAIN" ;;
+    esac
+}
+
+key_slots() {
+    case $1 in
+        uwsm-env) echo "uwsm-hypr uwsm-x" ;;
+        gtk3-settings) echo gtk3 ;;
+        xsettingsd) echo xsettingsd ;;
+        icons-default) echo icons ;;
+    esac
+}
+
+# ERE for everything before the value (group 1)
+slot_prefix() {
+    case $1 in
+        uwsm-hypr) printf '%s' "^([[:space:]]*export[[:space:]]+HYPRCURSOR_THEME=[\"']?)" ;;
+        uwsm-x) printf '%s' "^([[:space:]]*export[[:space:]]+XCURSOR_THEME=[\"']?)" ;;
+        gtk3) printf '%s' '^([[:space:]]*gtk-cursor-theme-name[[:space:]]*=[[:space:]]*)' ;;
+        xsettingsd) printf '%s' '^([[:space:]]*Gtk/CursorThemeName[[:space:]]+")' ;;
+        icons) printf '%s' '^([[:space:]]*Inherits[[:space:]]*=[[:space:]]*)' ;;
+    esac
+}
+
+slot_value_re() {
+    case $1 in
+        uwsm-*) printf '%s' "[^\"'[:space:]#]*" ;;
+        xsettingsd) printf '%s' '[^"]*' ;;
+        *) printf '%s' '[^[:space:]]*' ;;
+    esac
+}
+
+# slot_get <slot> <file>: the value it sets (empty if the line or the file is missing)
+slot_get() {
+    [[ -r $2 ]] || return 0
+    sed -n -E "s|$(slot_prefix "$1")($(slot_value_re "$1")).*|\\2|p" "$2" | head -n1 || true
+}
+
+# slot_set <slot> <file> <value>: replace only the value; quoting and the rest stay
+slot_set() {
+    [[ -f $2 ]] || return 0
+    local v=${3//\\/\\\\}
+    v=${v//&/\\&}
+    v=${v//|/\\|}
+    sed -i --follow-symlinks -E "s|$(slot_prefix "$1")$(slot_value_re "$1")|\\1$v|" "$2"
+}
+
+uwsm_value() {
     [[ -r $UWSM_ENV ]] || return 0
     sed -n -E "s/^[[:space:]]*export[[:space:]]+$1=[\"']?([^\"'[:space:]#]*).*/\\1/p" "$UWSM_ENV" | head -n1 || true
 }
 
 current_cursor() {
     local c
-    c=$(env_value HYPRCURSOR_THEME)
-    # no uwsm line: fall back to what GTK is set to
-    if [[ -z $c && -r $GTK3 ]]; then
-        c=$(sed -n -E 's/^[[:space:]]*gtk-cursor-theme-name[[:space:]]*=[[:space:]]*([^[:space:]]+).*/\1/p' "$GTK3" | head -n1 || true)
-    fi
+    c=$(slot_get uwsm-hypr "$UWSM_ENV")
+    [[ -n $c ]] || c=$(slot_get gtk3 "$GTK3")
     echo "$c"
 }
 
 cursor_size() {
     local s
-    s=$(env_value HYPRCURSOR_SIZE)
+    s=$(uwsm_value HYPRCURSOR_SIZE)
     echo "${s:-24}"
 }
 
-set_cursor() {
-    local theme=$1 size reply
-    size=$(cursor_size)
+gsettings_get() { gsettings get "$GSCHEMA" cursor-theme 2>/dev/null || true; }
 
-    # Only the value is replaced; quoting and anything after it stay as they were.
-    # Session environment for apps started after the next login:
-    if [[ ! -f $UWSM_ENV ]]; then
-        warn "$UWSM_ENV is missing: the cursor applies now, but the next login uses whatever theme the session sets"
-    elif ! grep -qE '^[[:space:]]*export[[:space:]]+HYPRCURSOR_THEME=' "$UWSM_ENV"; then
-        warn "$UWSM_ENV has no 'export HYPRCURSOR_THEME=...' line: the cursor applies now, but the next login uses whatever theme the session sets"
-    fi
-    if [[ -f $UWSM_ENV ]]; then
-        sed -i --follow-symlinks -E "s/^([[:space:]]*export[[:space:]]+(HYPR|X)CURSOR_THEME=[\"']?)[^\"'[:space:]#]*/\\1$theme/" "$UWSM_ENV"
-    fi
-    # GTK3 and XWayland apps, and anything asking for the "default" theme:
-    if [[ -f $GTK3 ]]; then
-        sed -i --follow-symlinks -E "s/^([[:space:]]*gtk-cursor-theme-name[[:space:]]*=[[:space:]]*)[^[:space:]]*/\\1$theme/" "$GTK3"
-    fi
-    if [[ -f $XSETTINGSD ]]; then
-        sed -i --follow-symlinks -E "s|^([[:space:]]*Gtk/CursorThemeName[[:space:]]+\")[^\"]*|\\1$theme|" "$XSETTINGSD"
-    fi
-    if [[ -f $ICONS_DEFAULT ]]; then
-        sed -i --follow-symlinks -E "s/^([[:space:]]*Inherits[[:space:]]*=[[:space:]]*)[^[:space:]]*/\\1$theme/" "$ICONS_DEFAULT"
-    fi
-    if command -v gsettings >/dev/null; then
-        gsettings set org.gnome.desktop.interface cursor-theme "$theme" || true
-    fi
+# value of a variable in the systemd user environment ("" when unset)
+session_env() {
+    local line
+    line=$(systemctl --user show-environment 2>/dev/null | grep -E "^$1=" | head -n1 || true)
+    echo "${line#*=}"
+}
+
+session_has() { systemctl --user show-environment 2>/dev/null | grep -qE "^$1="; }
+
+# Tell the running session about a cursor theme: xsettingsd, Hyprland's environment and cursor.
+# apply_session_cursor <HYPRCURSOR theme> [<XCURSOR theme>]
+apply_session_cursor() {
+    local hypr=$1 x=${2:-$1} reply
     if pgrep -x xsettingsd >/dev/null; then
         pkill -HUP -x xsettingsd || true
     fi
+    if have_hypr; then
+        hyprctl eval "hl.env(\"XCURSOR_THEME\", \"$x\"); hl.env(\"HYPRCURSOR_THEME\", \"$hypr\")" >/dev/null 2>&1 || true
+        if theme_dir "$hypr" >/dev/null; then
+            reply=$(hyprctl setcursor "$hypr" "$(cursor_size)" 2>&1 || true)
+            [[ $reply == ok ]] || warn "Hyprland did not switch the cursor now (${reply:-no reply}); it will at the next login"
+        else
+            warn "$hypr is not installed here, so Hyprland keeps its current cursor until the next login"
+        fi
+    fi
+}
 
-    # The running session: apps launched from now on, and the compositor's own cursor
+set_cursor_everywhere() {
+    local theme=$1 k slot
+    if [[ ! -f $UWSM_ENV ]]; then
+        warn "$UWSM_ENV is missing: the cursor applies now, but the next login uses whatever theme the session sets"
+    elif [[ -z $(slot_get uwsm-hypr "$UWSM_ENV") ]]; then
+        warn "$UWSM_ENV has no 'export HYPRCURSOR_THEME=...' line: the cursor applies now, but the next login uses whatever theme the session sets"
+    fi
+    for k in "${CURSOR_KEYS[@]}"; do
+        for slot in $(key_slots "$k"); do slot_set "$slot" "$(key_file "$k")" "$theme"; done
+    done
+    if command -v gsettings >/dev/null; then
+        gsettings set "$GSCHEMA" cursor-theme "$theme" || true
+    fi
     if command -v dbus-update-activation-environment >/dev/null; then
         dbus-update-activation-environment --systemd "XCURSOR_THEME=$theme" "HYPRCURSOR_THEME=$theme" || true
     else
-        systemctl --user set-environment "XCURSOR_THEME=$theme" "HYPRCURSOR_THEME=$theme" || true
+        systemctl --user set-environment "XCURSOR_THEME=$theme" "HYPRCURSOR_THEME=$theme" 2>/dev/null || true
     fi
-    if have_hypr; then
-        hyprctl eval "hl.env(\"XCURSOR_THEME\", \"$theme\"); hl.env(\"HYPRCURSOR_THEME\", \"$theme\")" >/dev/null 2>&1 || true
-        reply=$(hyprctl setcursor "$theme" "$size" 2>&1 || true)
-        [[ $reply == ok ]] || warn "Hyprland did not switch the cursor now (${reply:-no reply}); it will at the next login"
+    apply_session_cursor "$theme"
+}
+
+# ---------------------------------------------------------------------------------------
+# Saved state: $STATE/<part>/ holds files/<key> (or files/<key>.absent when the file did not
+# exist) and created; after/<key> (the file's checksum right after "on") and complete once
+# "on" has finished. For the cursor also theme and xtheme (the HYPRCURSOR and XCURSOR themes
+# in use before), gsettings (+ gsettings.default when the key was unset) and env (the systemd
+# lines, or the bare name of a variable that was unset).
+
+have_snapshot() { [[ -f $STATE/$1/created ]]; }
+snapshot_finished() { [[ -f $STATE/$1/complete ]]; }
+
+# snapshot_take <part> <keys...>: save the files before "on" changes them. The snapshot is
+# built in a private directory and moved into place in one step.
+snapshot_take() {
+    local part=$1 k f tmp
+    shift
+    tmp=$(mktemp -d "$STATE/.$part.XXXXXX")
+    mkdir -p "$tmp/files" "$tmp/after"
+    for k; do
+        f=$(key_file "$k")
+        if [[ -e $f ]]; then cat -- "$f" >"$tmp/files/$k"; else : >"$tmp/files/$k.absent"; fi
+    done
+    if [[ $part == cursor ]]; then
+        local hypr x gs="" gs_set=1 var
+        if command -v gsettings >/dev/null; then
+            gs=$(gsettings_get)
+            printf '%s\n' "$gs" >"$tmp/gsettings"
+            # unset in dconf means "the default": put that back with a reset, not a set
+            if command -v dconf >/dev/null && [[ -z $(dconf read "/${GSCHEMA//./\/}/cursor-theme" 2>/dev/null) ]]; then
+                : >"$tmp/gsettings.default"
+                gs_set=""
+            fi
+            gs=${gs#\'}
+            gs=${gs%\'}
+        fi
+        x=$(slot_get uwsm-x "$UWSM_ENV")
+        [[ -n $x ]] || x=$(session_env XCURSOR_THEME)
+        [[ -n $x ]] || x=$(slot_get gtk3 "$GTK3")
+        [[ -n $x || -z $gs_set ]] || x=$gs
+        [[ -n $x ]] || x=$(slot_get xsettingsd "$XSETTINGSD")
+        hypr=$(slot_get uwsm-hypr "$UWSM_ENV")
+        [[ -n $hypr ]] || hypr=$(session_env HYPRCURSOR_THEME)
+        [[ -n $hypr ]] || hypr=$x
+        printf '%s\n' "$hypr" >"$tmp/theme"
+        printf '%s\n' "$x" >"$tmp/xtheme"
+        if command -v systemctl >/dev/null; then
+            : >"$tmp/env"
+            for var in XCURSOR_THEME HYPRCURSOR_THEME; do
+                if session_has "$var"; then
+                    printf '%s=%s\n' "$var" "$(session_env "$var")" >>"$tmp/env"
+                else
+                    printf '%s\n' "$var" >>"$tmp/env"
+                fi
+            done
+        fi
     fi
-    echo "cursor: $theme (size $size)"
+    date '+%Y-%m-%d %H:%M' >"$tmp/created"
+    rm -rf "${STATE:?}/$part"
+    mv "$tmp" "$STATE/$part"
+}
+
+# snapshot_after <part> <keys...>: remember what the files look like right after "on"
+snapshot_after() {
+    local part=$1 k f
+    shift
+    for k; do
+        f=$(key_file "$k")
+        if [[ -e $f ]]; then sha "$f" >"$STATE/$part/after/$k"; fi
+    done
+    : >"$STATE/$part/complete"
+}
+
+# write_verbatim <source> <file>: replace <file>'s content with <source>'s through a temp
+# file in the same directory (works for read-only files, keeps the mode and any symlink)
+write_verbatim() {
+    local target tmp
+    target=$(readlink -f -- "$2")
+    tmp=$(mktemp "$(dirname -- "$target")/.rgb-theme.XXXXXX" 2>/dev/null) || return 1
+    if cat -- "$1" >"$tmp" && chmod --reference="$target" "$tmp" && mv -f -- "$tmp" "$target"; then
+        return 0
+    fi
+    rm -f -- "$tmp"
+    return 1
+}
+
+# snapshot_restore_file <part> <key>: put one file back. Returns 0 when done (restored
+# verbatim, or nothing to do), 1 when it changed since "on" (or could not be rewritten) and 2
+# when it appeared since; then the caller undoes only its own line.
+snapshot_restore_file() {
+    local d=$STATE/$1 k=$2 f
+    f=$(key_file "$k")
+    if [[ -e $d/files/$k.absent ]]; then
+        [[ -e $f ]] && return 2
+        return 0
+    fi
+    if [[ ! -e $f ]]; then
+        warn "$f was removed since 'on'; leaving it removed"
+        return 0
+    fi
+    if [[ -f $d/after/$k && $(sha "$f") == "$(cat "$d/after/$k")" ]]; then
+        write_verbatim "$d/files/$k" "$f" && return 0
+    fi
+    return 1
+}
+
+restore_cursor() {
+    local d=$STATE/cursor prev xprev k f slot old gs line var cur rc
+    prev=$(cat "$d/theme" 2>/dev/null || true)
+    xprev=$(cat "$d/xtheme" 2>/dev/null || true)
+    [[ -n $xprev ]] || xprev=$prev
+    for k in "${CURSOR_KEYS[@]}"; do
+        rc=0
+        snapshot_restore_file cursor "$k" || rc=$?
+        ((rc)) || continue
+        f=$(key_file "$k")
+        for slot in $(key_slots "$k"); do
+            old=$(slot_get "$slot" "$d/files/$k")
+            if [[ -z $old ]]; then
+                if [[ $slot == uwsm-hypr ]]; then old=$prev; else old=$xprev; fi
+            fi
+            if [[ -n $old && $(slot_get "$slot" "$f") == "$RGB_CURSOR" ]]; then slot_set "$slot" "$f" "$old"; fi
+        done
+        if ((rc == 2)); then
+            warn "$f appeared since 'on': left it, apart from a $RGB_CURSOR line"
+        elif snapshot_finished cursor; then
+            warn "$f changed since 'on': kept those edits and put back only the cursor theme line"
+        fi
+    done
+    # gsettings and the session environment go back only where they still say Bibata-RGB
+    if command -v gsettings >/dev/null && [[ -f $d/gsettings && $(gsettings_get) == "'$RGB_CURSOR'" ]]; then
+        if [[ -e $d/gsettings.default ]]; then
+            gsettings reset "$GSCHEMA" cursor-theme || true
+        else
+            gs=$(cat "$d/gsettings")
+            gs=${gs#\'}
+            gs=${gs%\'}
+            if [[ -n $gs ]]; then gsettings set "$GSCHEMA" cursor-theme "$gs" || true; fi
+        fi
+    fi
+    if [[ -f $d/env ]]; then
+        while IFS= read -r line; do
+            var=${line%%=*}
+            cur=$(session_env "$var")
+            [[ $cur == "$RGB_CURSOR" ]] || continue
+            if [[ $line == *=* ]]; then
+                if command -v dbus-update-activation-environment >/dev/null; then
+                    dbus-update-activation-environment --systemd "$line" || true
+                else
+                    systemctl --user set-environment "$line" 2>/dev/null || true
+                fi
+            else
+                # (the D-Bus activation environment cannot unset a variable; it keeps the value
+                # until the next login, which only matters to D-Bus-started apps)
+                systemctl --user unset-environment "$var" 2>/dev/null || true
+            fi
+        done <"$d/env"
+    fi
+    if [[ -n $prev ]]; then
+        apply_session_cursor "$prev" "$xprev"
+    else
+        warn "the previous cursor theme is unknown; Hyprland keeps its current cursor until the next login"
+    fi
+    rm -rf "$d"
+    echo "cursor: restored ${prev:-the previous settings} (size $(cursor_size))"
+}
+
+# ---------------------------------------------------------------------------------------
+# on / off
+
+cursor_on() {
+    local cur take=""
+    cur=$(current_cursor)
+    if ! have_snapshot cursor; then
+        [[ $cur == "$RGB_CURSOR" ]] || take=1
+    elif snapshot_finished cursor && [[ -n $cur && $cur != "$RGB_CURSOR" ]]; then
+        take=1  # the look was undone another way: the snapshot from before is stale
+    fi
+    if [[ -n $take ]]; then
+        snapshot_take cursor "${CURSOR_KEYS[@]}"
+        set_cursor_everywhere "$RGB_CURSOR"
+        snapshot_after cursor "${CURSOR_KEYS[@]}"
+    elif have_snapshot cursor && ! snapshot_finished cursor; then
+        # an earlier "on" stopped part-way: its snapshot holds the state before it
+        set_cursor_everywhere "$RGB_CURSOR"
+        snapshot_after cursor "${CURSOR_KEYS[@]}"
+    else
+        set_cursor_everywhere "$RGB_CURSOR"
+    fi
+    echo "cursor: $RGB_CURSOR (size $(cursor_size))"
+}
+
+cursor_off() {
+    local cur
+    cur=$(current_cursor)
+    if have_snapshot cursor; then
+        if snapshot_finished cursor && [[ -n $cur && $cur != "$RGB_CURSOR" ]]; then
+            rm -rf "${STATE:?}/cursor"
+            echo "cursor: already off ($cur); dropped the saved state"
+        else
+            restore_cursor
+        fi
+    elif [[ $cur == "$RGB_CURSOR" ]]; then
+        warn "no saved state (switched on by rgb-theme 1.0); switching to $FALLBACK_CURSOR"
+        set_cursor_everywhere "$FALLBACK_CURSOR"
+        echo "cursor: $FALLBACK_CURSOR (size $(cursor_size))"
+    else
+        echo "cursor: already off (${cur:-?})"
+    fi
 }
 
 borders_on() { [[ -f $HYPR_MAIN ]] && grep -qxF "$REQUIRE_LINE" "$HYPR_MAIN"; }
@@ -131,49 +412,251 @@ reload_hypr() {
     fi
 }
 
-set_borders() {
+remove_require_line() {
     local n
-    if [[ $1 == on ]]; then
-        if ! borders_on; then
-            n=$(awk -v line="$ANCHOR_LINE" '$0 == line { print NR; exit }' "$HYPR_MAIN")
-            if [[ -n $n ]]; then
-                sed -i --follow-symlinks "${n}a $REQUIRE_LINE" "$HYPR_MAIN"
-            else
-                # no anchor: append, after making sure the file ends with a newline
-                [[ -s $HYPR_MAIN && -n $(tail -c1 "$HYPR_MAIN") ]] && echo >>"$HYPR_MAIN"
-                printf '%s\n' "$REQUIRE_LINE" >>"$HYPR_MAIN"
-            fi
-        fi
-    else
-        # delete from the bottom up so earlier line numbers stay valid
-        for n in $(awk -v line="$REQUIRE_LINE" '$0 == line { print NR }' "$HYPR_MAIN" | sort -rn); do
-            sed -i --follow-symlinks "${n}d" "$HYPR_MAIN"
-        done
-    fi
-    reload_hypr
-    echo "borders: $1"
+    # delete from the bottom up so earlier line numbers stay valid
+    for n in $(awk -v line="$REQUIRE_LINE" '$0 == line { print NR }' "$HYPR_MAIN" | sort -rn); do
+        sed -i --follow-symlinks "${n}d" "$HYPR_MAIN"
+    done
 }
 
-spin_mode() { sed -n -E 's/^local SPIN = "([a-z]+)".*/\1/p' "$RGB_MODULE" 2>/dev/null | head -n1; }
+add_require_line() {
+    local n
+    n=$(awk -v line="$ANCHOR_LINE" '$0 == line { print NR; exit }' "$HYPR_MAIN")
+    if [[ -n $n ]]; then
+        sed -i --follow-symlinks "${n}a $REQUIRE_LINE" "$HYPR_MAIN"
+    else
+        # no anchor: append, after making sure the file ends with a newline
+        [[ -s $HYPR_MAIN && -n $(tail -c1 "$HYPR_MAIN") ]] && echo >>"$HYPR_MAIN"
+        printf '%s\n' "$REQUIRE_LINE" >>"$HYPR_MAIN"
+    fi
+}
+
+borders_switch_on() {
+    if have_snapshot borders && ! snapshot_finished borders; then
+        borders_on || add_require_line
+        snapshot_after borders hyprland-lua
+    elif ! borders_on; then
+        # off now: take a fresh snapshot (one left over from before is stale)
+        snapshot_take borders hyprland-lua
+        add_require_line
+        snapshot_after borders hyprland-lua
+    fi
+    reload_hypr
+    echo "borders: on"
+}
+
+borders_switch_off() {
+    local rc=0 saved
+    if ! borders_on; then
+        if have_snapshot borders; then rm -rf "${STATE:?}/borders"; fi
+        echo "borders: already off"
+        return 0
+    fi
+    if have_snapshot borders; then
+        saved=$STATE/borders/files/hyprland-lua
+        snapshot_restore_file borders hyprland-lua || rc=$?
+        if ((rc)); then
+            remove_require_line
+            # the require line went in after the original's last line: give back its missing
+            # final newline too, unless the end of the file was edited since
+            if [[ -s $saved && -n $(tail -c1 "$saved") && -z $(tail -c1 "$HYPR_MAIN") &&
+                $(tail -n1 "$saved") == "$(tail -n1 "$HYPR_MAIN")" ]]; then
+                truncate -s -1 "$(readlink -f -- "$HYPR_MAIN")"
+            fi
+            snapshot_finished borders &&
+                warn "$HYPR_MAIN changed since 'on': kept those edits and removed only $REQUIRE_LINE"
+        fi
+        rm -rf "${STATE:?}/borders"
+    else
+        remove_require_line
+    fi
+    reload_hypr
+    echo "borders: off"
+}
+
+# ---------------------------------------------------------------------------------------
+# spin and speed
+
+module_value() { sed -n -E "s/^local $1 = \"?([^\" ]+)\"?.*/\\1/p" "$RGB_MODULE" 2>/dev/null | head -n1 || true; }
 
 set_spin() {
     [[ -f $RGB_MODULE ]] || die "$RGB_MODULE not found (run install.sh)"
     grep -qE '^local SPIN = "' "$RGB_MODULE" || die "$RGB_MODULE has no 'local SPIN = \"...\"' line"
     sed -i --follow-symlinks -E "s/^(local SPIN = \")[^\"]*(\".*)/\\1$1\\2/" "$RGB_MODULE"
-    [[ $(spin_mode) == "$1" ]] || die "could not set SPIN in $RGB_MODULE"
+    [[ $(module_value SPIN) == "$1" ]] || die "could not set SPIN in $RGB_MODULE"
     if borders_on; then reload_hypr; fi
     echo "spin: $1$(borders_on || echo ' (borders are off; used once they are on)')"
 }
+
+# seconds (1.5 or 1,5) -> ms if within [lo, hi] ms; prints nothing when invalid
+seconds_to_ms() {
+    awk -v s="${1/,/.}" -v lo="$2" -v hi="$3" 'BEGIN {
+        if (s !~ /^[0-9]*\.?[0-9]+$/) exit
+        ms = int(s * 1000 + 0.5)
+        if (ms >= lo && ms <= hi) print ms
+    }'
+}
+
+ms_to_seconds() { awk -v ms="$1" 'BEGIN { printf "%g", ms / 1000 }'; }
+
+cursor_cycle_ms() {
+    local v=""
+    [[ -f $RGB_THEME_DIR/BUILD-INFO ]] && v=$(sed -n 's/^cycle_ms=//p' "$RGB_THEME_DIR/BUILD-INFO" | head -n1)
+    echo "${v:-$DEFAULT_CYCLE_MS}"
+}
+
+# retime_theme <theme dir> <ms>: rewrite every frame delay so one rainbow cycle lasts <ms>.
+# The frames stay the same, so the flow stays as smooth, only faster or slower.
+retime_theme() {
+    command -v python3 >/dev/null || die "python3 is needed to change the cursor speed"
+    python3 - "$1" "$2" <<'PYEOF'
+import io, os, re, struct, sys, tempfile, zipfile
+
+theme, cycle = sys.argv[1], int(sys.argv[2])
+
+
+def delays(n):
+    """n integer delays that add up to exactly one cycle"""
+    return [round((i + 1) * cycle / n) - round(i * cycle / n) for i in range(n)]
+
+
+def replace(path, data):
+    mode = os.stat(path).st_mode & 0o7777 if os.path.exists(path) else 0o644
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".retime-")
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+# hyprcursor: the delay is the last field of each define_size line; every size is its own
+# animation (SVG themes have one, size 0)
+frame_re = re.compile(r"^(\s*define_size\s*=\s*([^,]+),\s*[^,]+),\s*\d+\s*$")
+hdir = os.path.join(theme, "hyprcursors")
+for name in sorted(os.listdir(hdir)):
+    if not name.endswith(".hlc"):
+        continue
+    path = os.path.join(hdir, name)
+    with zipfile.ZipFile(path) as z:
+        members = [(info, z.read(info.filename)) for info in z.infolist()]
+    meta = next(data for info, data in members if info.filename == "meta.hl")
+    lines = meta.decode().splitlines()
+    by_size = {}
+    for i, line in enumerate(lines):
+        m = frame_re.match(line)
+        if m:
+            by_size.setdefault(m.group(2).strip(), []).append(i)
+    for indices in by_size.values():
+        for i, d in zip(indices, delays(len(indices))):
+            lines[i] = frame_re.sub(rf"\g<1>, {d}", lines[i])
+    new_meta = ("\n".join(lines) + "\n").encode()
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as out:
+        for info, data in members:
+            out.writestr(info, new_meta if info.filename == "meta.hl" else data)
+    replace(path, buf.getvalue())
+
+# XCursor: the delay is the 9th field of each image header; every size is its own animation
+xdir = os.path.join(theme, "cursors")
+for name in sorted(os.listdir(xdir)):
+    path = os.path.join(xdir, name)
+    if os.path.islink(path) or not os.path.isfile(path):
+        continue
+    data = bytearray(open(path, "rb").read())
+    if data[:4] != b"Xcur":
+        continue
+    ntoc = struct.unpack_from("<I", data, 12)[0]
+    by_size = {}
+    for i in range(ntoc):
+        typ, subtype, pos = struct.unpack_from("<III", data, 16 + i * 12)
+        if typ == 0xFFFD0002:
+            by_size.setdefault(subtype, []).append(pos)
+    for positions in by_size.values():
+        for pos, d in zip(positions, delays(len(positions))):
+            struct.pack_into("<I", data, pos + 32, d)
+    replace(path, bytes(data))
+
+info = os.path.join(theme, "BUILD-INFO")
+text = open(info).read() if os.path.exists(info) else ""
+text = re.sub(r"(?m)^cycle_ms=.*\n?", "", text)
+if text and not text.endswith("\n"):
+    text += "\n"
+replace(info, (text + f"cycle_ms={cycle}\n").encode())
+PYEOF
+}
+
+speed_cursor() {
+    local arg=$1 reload=$2 ms
+    [[ -d $RGB_THEME_DIR/hyprcursors ]] || die "$RGB_THEME_DIR is not installed (run install.sh)"
+    if [[ $arg == default ]]; then ms=$DEFAULT_CYCLE_MS; else ms=$(seconds_to_ms "$arg" 300 20000); fi
+    [[ -n $ms ]] || die "cursor speed: give seconds per rainbow cycle, 0.3-20 (e.g. 1.2), or 'default'"
+    retime_theme "$RGB_THEME_DIR" "$ms"
+    if [[ $reload == yes && $(current_cursor) == "$RGB_CURSOR" ]]; then
+        apply_session_cursor "$RGB_CURSOR"
+    fi
+    echo "cursor speed: $(ms_to_seconds "$ms") s per rainbow cycle"
+}
+
+speed_borders() {
+    local arg=$1 ms turn
+    [[ -f $RGB_MODULE ]] || die "$RGB_MODULE not found (run install.sh)"
+    grep -qE '^local TURN = ' "$RGB_MODULE" || die "$RGB_MODULE has no 'local TURN = ...' line (run install.sh)"
+    if [[ $arg == default ]]; then ms=$((DEFAULT_TURN * 1000)); else ms=$(seconds_to_ms "$arg" 300 10000); fi
+    [[ -n $ms ]] || die "border speed: give seconds per turn, 0.3-10 (e.g. 3), or 'default'"
+    turn=$(ms_to_seconds "$ms")
+    sed -i --follow-symlinks -E "s/^(local TURN = )[0-9.]+/\\1$turn/" "$RGB_MODULE"
+    if borders_on; then reload_hypr; fi
+    echo "border speed: $turn s per turn$([[ $(module_value SPIN) == loop ]] || echo ' (used with spin loop)')"
+}
+
+borders_summary() {
+    if [[ -f $RGB_MODULE ]]; then
+        echo "spin: $(module_value SPIN), $(module_value TURN) s per turn"
+    else
+        echo "module not installed (run install.sh)"
+    fi
+}
+
+speed_show() {
+    if [[ -d $RGB_THEME_DIR ]]; then
+        echo "cursor:  $(ms_to_seconds "$(cursor_cycle_ms)") s per rainbow cycle"
+    else
+        echo "cursor:  $RGB_CURSOR not installed (run install.sh)"
+    fi
+    echo "borders: $(borders_summary)"
+}
+
+# ---------------------------------------------------------------------------------------
 
 status() {
     local c
     c=$(current_cursor)
     echo "cursor:  ${c:-?} (size $(cursor_size))$([[ $c == "$RGB_CURSOR" ]] && echo '  [RGB]')"
-    [[ -f $GTK3 ]] && echo "  gtk-3.0:     $(sed -n -E 's/^[[:space:]]*gtk-cursor-theme-name[[:space:]]*=[[:space:]]*//p' "$GTK3")"
-    [[ -f $XSETTINGSD ]] && echo "  xsettingsd:  $(sed -n -E 's|^[[:space:]]*Gtk/CursorThemeName[[:space:]]+||p' "$XSETTINGSD")"
-    [[ -f $ICONS_DEFAULT ]] && echo "  icons/default inherits: $(sed -n -E 's/^[[:space:]]*Inherits[[:space:]]*=[[:space:]]*//p' "$ICONS_DEFAULT")"
-    command -v gsettings >/dev/null && echo "  gsettings:   $(gsettings get org.gnome.desktop.interface cursor-theme 2>/dev/null || echo '?')"
-    echo "borders: $(borders_on && echo 'on  [RGB]' || echo off), spin: $(spin_mode || true)"
+    [[ -f $GTK3 ]] && echo "  gtk-3.0:     $(slot_get gtk3 "$GTK3")"
+    [[ -f $XSETTINGSD ]] && echo "  xsettingsd:  $(slot_get xsettingsd "$XSETTINGSD")"
+    [[ -f $ICONS_DEFAULT ]] && echo "  icons/default inherits: $(slot_get icons "$ICONS_DEFAULT")"
+    command -v gsettings >/dev/null && echo "  gsettings:   $(gsettings_get)"
+    if have_snapshot cursor; then
+        if ! snapshot_finished cursor; then
+            echo "  off restores: $(cat "$STATE/cursor/theme") (saved $(cat "$STATE/cursor/created"); 'on' did not finish)"
+        elif [[ -n $c && $c != "$RGB_CURSOR" ]]; then
+            echo "  saved state from $(cat "$STATE/cursor/created") is stale (the look was undone another way)"
+        else
+            echo "  off restores: $(cat "$STATE/cursor/theme") (saved $(cat "$STATE/cursor/created"))"
+        fi
+    elif [[ $c == "$RGB_CURSOR" ]]; then
+        if theme_dir "$FALLBACK_CURSOR" >/dev/null; then
+            echo "  off switches to $FALLBACK_CURSOR (no saved state: switched on by rgb-theme 1.0)"
+        else
+            echo "  no saved state (switched on by rgb-theme 1.0) and $FALLBACK_CURSOR is not installed: set the theme yourself"
+        fi
+    fi
+    [[ -d $RGB_THEME_DIR ]] && echo "  speed: $(ms_to_seconds "$(cursor_cycle_ms)") s per rainbow cycle"
+    echo "borders: $(borders_on && echo 'on  [RGB]' || echo off), $(borders_summary)"
+    if have_snapshot borders; then
+        echo "  off restores: hyprland.lua as saved $(cat "$STATE/borders/created")"
+    fi
     if have_hypr; then
         local v
         v=$(hyprctl getoption general:col:active_border 2>/dev/null) || v="? (could not reach Hyprland)"
@@ -182,37 +665,88 @@ status() {
     return 0
 }
 
-# Everything the requested change needs, checked before any file is touched
+# can_edit <file>: sed -i and the verbatim restore write through the file's directory
+can_edit() {
+    local t
+    t=$(readlink -f -- "$1")
+    [[ -w $(dirname -- "$t") ]]
+}
+
+# Everything the requested change needs, checked before any file is touched. Sets DO_CURSOR
+# and DO_BORDERS to the parts that will run.
 preflight() {
-    local action=$1 what=$2
-    if [[ $what == all || $what == cursor ]]; then
-        local target=$ORIG_CURSOR
-        [[ $action == on ]] && target=$RGB_CURSOR
-        theme_dir "$target" >/dev/null || die "cursor theme $target is not installed"
-    fi
-    if [[ $what == all || $what == borders ]]; then
-        [[ -f $HYPR_MAIN ]] || die "$HYPR_MAIN not found"
-        [[ -w $HYPR_MAIN ]] || die "$HYPR_MAIN is not writable"
+    local action=$1 what=$2 k f
+    DO_CURSOR="" DO_BORDERS=""
+    [[ $what == all || $what == cursor ]] && DO_CURSOR=1
+    [[ $what == all || $what == borders ]] && DO_BORDERS=1
+    if [[ -n $DO_CURSOR ]]; then
         if [[ $action == on ]]; then
-            [[ -f $RGB_MODULE ]] || die "$RGB_MODULE not found (run install.sh)"
+            theme_dir "$RGB_CURSOR" >/dev/null || die "cursor theme $RGB_CURSOR is not installed (run install.sh)"
+        elif ! have_snapshot cursor && [[ $(current_cursor) == "$RGB_CURSOR" ]] &&
+            ! theme_dir "$FALLBACK_CURSOR" >/dev/null; then
+            [[ $what == cursor ]] &&
+                die "no saved state to restore and $FALLBACK_CURSOR is not installed; set your cursor theme yourself"
+            warn "no saved state to restore and $FALLBACK_CURSOR is not installed: leaving the cursor as it is"
+            DO_CURSOR=""
         fi
+    fi
+    if [[ -n $DO_CURSOR ]]; then
+        for k in "${CURSOR_KEYS[@]}"; do
+            f=$(key_file "$k")
+            if [[ -e $f ]] && ! can_edit "$f"; then
+                die "cannot write to $(dirname -- "$(readlink -f -- "$f")") (needed to change $f); nothing was changed"
+            fi
+        done
+    fi
+    if [[ -n $DO_BORDERS ]]; then
+        if [[ ! -f $HYPR_MAIN ]]; then
+            [[ $action == off && $what == all ]] || die "$HYPR_MAIN not found"
+            DO_BORDERS=""  # nothing to undo
+        else
+            can_edit "$HYPR_MAIN" || die "cannot write to the directory of $HYPR_MAIN; nothing was changed"
+            if [[ $action == on && ! -f $RGB_MODULE ]]; then
+                die "$RGB_MODULE not found (run install.sh)"
+            fi
+        fi
+    fi
+}
+
+# One rgb-theme at a time: two quick toggles must not interleave their snapshots
+lock_state() {
+    mkdir -p "$STATE"
+    if command -v flock >/dev/null; then
+        exec 9>"$STATE/.lock"
+        flock 9
     fi
 }
 
 action=${1:-status}
 case $action in
     -h | --help | help) usage; exit 0 ;;
+    version | --version) echo "rgb-theme $VERSION"; exit 0 ;;
     status) status; exit 0 ;;
     spin)
-        case ${2:-} in loop | focus | off) set_spin "$2"; exit 0 ;; *) die "usage: rgb-theme spin loop|focus|off" ;; esac
+        case ${2:-} in loop | focus | off) lock_state; set_spin "$2"; exit 0 ;; *) die "usage: rgb-theme spin loop|focus|off" ;; esac
+        ;;
+    speed)
+        reload=yes
+        [[ ${4:-} == --no-reload ]] && reload=no
+        case ${2:-} in
+            "") speed_show ;;
+            cursor) [[ -n ${3:-} ]] || die "usage: rgb-theme speed cursor <seconds>|default"; lock_state; speed_cursor "$3" "$reload" ;;
+            borders) [[ -n ${3:-} ]] || die "usage: rgb-theme speed borders <seconds>|default"; lock_state; speed_borders "$3" ;;
+            *) die "usage: rgb-theme speed [cursor|borders <seconds>|default]" ;;
+        esac
+        exit 0
         ;;
     on | off | toggle) ;;
-    *) die "unknown action '$action' (on, off, toggle, status, spin; see --help)" ;;
+    *) die "unknown action '$action' (on, off, toggle, status, spin, speed, version; see --help)" ;;
 esac
 
 what=${2:-all}
 case $what in all | cursor | borders) ;; *) die "unknown part '$what' (all, cursor, borders)" ;; esac
 
+lock_state
 if [[ $action == toggle ]]; then
     case $what in
         cursor) if [[ $(current_cursor) == "$RGB_CURSOR" ]]; then action=off; else action=on; fi ;;
@@ -222,9 +756,9 @@ if [[ $action == toggle ]]; then
 fi
 
 preflight "$action" "$what"
-if [[ $what == all || $what == cursor ]]; then
-    if [[ $action == on ]]; then set_cursor "$RGB_CURSOR"; else set_cursor "$ORIG_CURSOR"; fi
+if [[ -n $DO_CURSOR ]]; then
+    if [[ $action == on ]]; then cursor_on; else cursor_off; fi
 fi
-if [[ $what == all || $what == borders ]]; then
-    set_borders "$action"
+if [[ -n $DO_BORDERS ]]; then
+    if [[ $action == on ]]; then borders_switch_on; else borders_switch_off; fi
 fi

@@ -15,7 +15,7 @@ import generate  # noqa: E402
 theme = here / "build/Bibata-RGB/hyprcursors"
 SHAPES = ["left_ptr", "hand2", "xterm", "grabbing", "wait", "left_ptr_watch",
           "crossed_circle", "top_left_corner", "fd_double_arrow", "zoom-in"]
-SIZE, PAD, STEP_MS, CYCLE_MS = 64, 14, 60, generate.CYCLE_MS
+SIZE, PAD, STEP_MS, CYCLE_MS = 64, 14, 60, generate.DEFAULT_CYCLE_MS
 
 
 def load(name):

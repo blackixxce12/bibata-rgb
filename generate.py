@@ -16,6 +16,7 @@ Outline (#000000) and fixed colours (badges, the white "X" glyphs) are kept.
 """
 
 import argparse
+import hashlib
 import os
 import re
 import shutil
@@ -33,13 +34,30 @@ gi.require_version("Rsvg", "2.0")
 from gi.repository import Rsvg  # noqa: E402
 
 THEME_NAME = "Bibata-RGB"
+VERSION = "1.1.0"
 SOURCE_THEME = Path(__file__).resolve().parent / "vendor/Bibata-Modern-Ice"
 
-# One rainbow cycle lasts CYCLE_MS everywhere, so every cursor flows at the same speed.
-CYCLE_MS = 2160
-HYPR_FRAMES = 36  # 60 ms per frame
+# The exact source this generator is written for. The recolouring rules below match this
+# theme's SVG markup (colours, paths, the spinner blades), so any other source is refused
+# unless --no-verify is given; the structure checks in validate_source() run either way.
+SOURCE_NAME = "Bibata-Modern-Ice"
+SOURCE_VERSION = "v2.0.6"
+SOURCE_TREE_SHA256 = "08a299b45d761f6c006eeb80bd2691e2d125770b04e66d2bfde9a76f781ab0f0"
+SOURCE_SHAPES = 56
+SOURCE_NAMES = 145  # shapes + define_override aliases
+
+# One rainbow cycle lasts the same time on every cursor (--cycle-ms); rgb-theme speed cursor
+# changes it later by rewriting the frame delays.
+DEFAULT_CYCLE_MS = 2160
+CYCLE_MS_RANGE = (300, 20000)
+HYPR_FRAMES = 36  # 60 ms per frame at the default cycle
 XCUR_FRAMES = 24  # 90 ms per frame; XCursor files are raw ARGB, so fewer frames keeps them small
-XCUR_SIZES = [24, 32, 40, 48, 64]
+# XCursor sizes (--xcursor): lite keeps the files small (~54 MB), full matches the original
+# theme's 16-96 px range (~235 MB). Hyprland and libXcursor load only the size they need.
+XCUR_PROFILES = {
+    "lite": [24, 32, 40, 48, 64],
+    "full": [16, 20, 22, 24, 28, 32, 40, 48, 56, 64, 72, 80, 88, 96],
+}
 # hyprcursor frames are SVG by default: they render at exactly the size Hyprland asks for
 # (24 x the highest monitor scale). Each load renders all ~2050 frames, ~0.5 s, paid when
 # Hyprland (re)loads the theme: at start, on setcursor, and twice per monitor layout change
@@ -114,14 +132,22 @@ def gradient_defs(phase, axis):
     return f"<defs>{gradient(GRADIENT_ID, shift)}{gradient(ALT_GRADIENT_ID, shift + PERIOD / 2)}</defs>"
 
 
-def recolor(svg, phase, name, axis="diag"):
-    svg, replaced = BODY_RE.subn(rf'\1="{RAINBOW_URL}"', svg)
+def recolor_counted(svg, name):
+    """Apply the colour rules; return the SVG (without gradient defs) and how often each rule
+    matched: body, one count per EXTRA_BODY rule of this shape, spinner blades."""
+    svg, body = BODY_RE.subn(rf'\1="{RAINBOW_URL}"', svg)
+    extras = []
     for pattern, replacement in EXTRA_BODY.get(name, []):
         svg, n = pattern.subn(replacement, svg)
-        replaced += n
-    if replaced == 0:
+        extras.append(n)
+    svg, blades = SPINNER_BLADE_RE.subn(lambda m: SPINNER_BLADES[m.group(1)], svg)
+    return svg, body, extras, blades
+
+
+def recolor(svg, phase, name, axis="diag"):
+    svg, body, extras, _ = recolor_counted(svg, name)
+    if body + sum(extras) == 0:
         raise ValueError(f"{name}: no body colour to replace")
-    svg = SPINNER_BLADE_RE.sub(lambda m: SPINNER_BLADES[m.group(1)], svg)
     m = SVG_OPEN_RE.search(svg)
     if not m:
         raise ValueError(f"{name}: no <svg> element")
@@ -175,14 +201,18 @@ def read_source_shape(hlc):
     return header, frames, overrides, svgs
 
 
-def frame_plan(src_frames, src_svgs, count):
-    """[(svg, phase, delay_ms)] for one output animation of `count` frames for static shapes."""
-    if len(src_frames) > 1:
-        # Already animated (spinner): keep its frames and timing, advance the rainbow per frame.
-        n = len(src_frames)
-        return [(src_svgs[i], i / n, src_frames[i][2]) for i in range(n)]
-    delay = round(CYCLE_MS / count)
-    return [(src_svgs[0], i / count, delay) for i in range(count)]
+def frame_delays(cycle_ms, n):
+    """n integer delays that add up to exactly cycle_ms."""
+    return [round((i + 1) * cycle_ms / n) - round(i * cycle_ms / n) for i in range(n)]
+
+
+def frame_plan(src_svgs, count, cycle_ms):
+    """[(svg, phase, delay_ms)]: one rainbow cycle in `count` frames for static shapes. The
+    animated shapes (spinners) keep their own frames and advance the rainbow one step each."""
+    if len(src_svgs) > 1:
+        n = len(src_svgs)
+        return [(src_svgs[i], i / n, d) for i, d in enumerate(frame_delays(cycle_ms, n))]
+    return [(src_svgs[0], i / count, d) for i, d in enumerate(frame_delays(cycle_ms, count))]
 
 
 def render_surface(svg, size):
@@ -233,7 +263,7 @@ def xcursor_file(images):
 
 
 def build_shape(args):
-    name, hlc, hypr_dir, xcur_dir, src_xcursor, hypr_format = args
+    name, hlc, hypr_dir, xcur_dir, src_xcursor, hypr_format, cycle_ms, xcur_sizes = args
     header, frames, overrides, svgs = read_source_shape(hlc)
     hotspot = {}
     for line in header:
@@ -246,7 +276,7 @@ def build_shape(args):
     # hyprcursor
     shape_dir = Path(hypr_dir) / name
     shape_dir.mkdir(parents=True, exist_ok=True)
-    plan = frame_plan(frames, svgs, HYPR_FRAMES)
+    plan = frame_plan(svgs, HYPR_FRAMES, cycle_ms)
     if hypr_format == "svg":
         lines = list(header) + [""]
         for i, (svg, phase, delay) in enumerate(plan):
@@ -266,14 +296,92 @@ def build_shape(args):
 
     # XCursor: PNG frames at fixed sizes, hotspots copied from the original theme
     hot = read_xcursor_hotspots(Path(src_xcursor)) if src_xcursor else {}
-    xplan = frame_plan(frames, svgs, XCUR_FRAMES)
+    xplan = frame_plan(svgs, XCUR_FRAMES, cycle_ms)
     images = []
-    for size in XCUR_SIZES:
+    for size in xcur_sizes:
         xh, yh = hot.get(size, (round(hotspot.get("hotspot_x", 0) * size), round(hotspot.get("hotspot_y", 0) * size)))
         for svg, phase, delay in xplan:
             images.append((size, xh, yh, delay, render_argb(recolor(svg, phase, name, axis), size)))
     (Path(xcur_dir) / name).write_bytes(xcursor_file(images))
     return name, axis, len(plan), len(xplan)
+
+
+def tree_sha256(root):
+    """Checksum of a directory tree: every file's path and content, every symlink's target."""
+    h = hashlib.sha256()
+    for p in sorted(root.rglob("*"), key=lambda p: p.relative_to(root).as_posix()):
+        rel = p.relative_to(root).as_posix()
+        if p.is_symlink():
+            h.update(f"L {rel} {os.readlink(p)}\n".encode())
+        elif p.is_file():
+            h.update(f"F {rel} {hashlib.sha256(p.read_bytes()).hexdigest()}\n".encode())
+    return h.hexdigest()
+
+
+def manifest_fields(path):
+    fields = {}
+    for line in path.read_text().splitlines():
+        key, sep, value = line.partition("=")
+        if sep:
+            fields[key.strip()] = value.strip()
+    return fields
+
+
+def validate_source(source, verify):
+    """Problems that would make the build wrong, as a list of messages (empty = fine)."""
+    problems = []
+    src_hypr, src_xcur = source / "hyprcursors", source / "cursors"
+    if not src_hypr.is_dir() or not src_xcur.is_dir() or not (source / "manifest.hl").is_file():
+        return [f"{source} is incomplete (needs manifest.hl, hyprcursors/ and cursors/); "
+                "re-clone the repository or pass --source"]
+    if verify:
+        fields = manifest_fields(source / "manifest.hl")
+        found = f"{fields.get('name', '?')} {fields.get('version', '?')}"
+        if found != f"{SOURCE_NAME} {SOURCE_VERSION}":
+            problems.append(f"source is {found}, this generator is written for {SOURCE_NAME} {SOURCE_VERSION}")
+        digest = tree_sha256(source)
+        if digest != SOURCE_TREE_SHA256:
+            problems.append(f"source tree checksum {digest} differs from the expected "
+                            f"{SOURCE_TREE_SHA256} ({SOURCE_NAME} {SOURCE_VERSION} as vendored)")
+
+    shapes = sorted(p.stem for p in src_hypr.glob("*.hlc"))
+    names = set(shapes)
+    for name in shapes:
+        try:
+            _, frames, overrides, svgs = read_source_shape(src_hypr / f"{name}.hlc")
+        except (KeyError, ValueError, zipfile.BadZipFile) as e:
+            problems.append(f"{name}: unreadable archive ({e})")
+            continue
+        names.update(o.split("=", 1)[1].strip() for o in overrides)
+        xfile = src_xcur / name
+        if not xfile.is_file() or xfile.is_symlink():
+            problems.append(f"{name}: no XCursor file {xfile.name} for the hotspots")
+        if not svgs or not all(f.endswith(".svg") for _, f, _ in frames):
+            problems.append(f"{name}: expected SVG frames")
+            continue
+        for i, svg in enumerate(svgs, 1):
+            if not SVG_OPEN_RE.search(svg):
+                problems.append(f"{name} frame {i}: no <svg> element")
+                continue
+            _, body, extras, blades = recolor_counted(svg, name)
+            if body + sum(extras) == 0:
+                problems.append(f"{name} frame {i}: nothing to recolour (no white body)")
+            for k, n in enumerate(extras):
+                if n == 0:
+                    problems.append(f"{name} frame {i}: special rule {k + 1} for this shape matched nothing")
+            if len(svgs) > 1 and blades != len(SPINNER_BLADES):
+                problems.append(f"{name} frame {i}: {blades} of {len(SPINNER_BLADES)} spinner blades found")
+    if verify and len(shapes) != SOURCE_SHAPES:
+        problems.append(f"{len(shapes)} shapes, expected {SOURCE_SHAPES}")
+    if verify and len(names) != SOURCE_NAMES:
+        problems.append(f"{len(names)} cursor names (shapes + aliases), expected {SOURCE_NAMES}")
+    for name in EXTRA_BODY:
+        if name not in shapes:
+            problems.append(f"special-cased shape {name} is missing from the source")
+    for alias in sorted(src_xcur.iterdir()):
+        if alias.is_symlink() and not (src_xcur / os.readlink(alias)).is_file():
+            problems.append(f"XCursor alias {alias.name} -> {os.readlink(alias)} points to no file")
+    return problems
 
 
 def main():
@@ -285,14 +393,29 @@ def main():
     ap.add_argument("--jobs", type=int, default=4)
     ap.add_argument("--hypr-format", choices=["svg", "png"], default="svg",
                     help="hyprcursor frame format (default: svg; see HYPR_PNG_SIZES for png)")
+    ap.add_argument("--cycle-ms", type=int, default=DEFAULT_CYCLE_MS,
+                    help=f"length of one rainbow cycle in ms (default {DEFAULT_CYCLE_MS}, "
+                         f"{CYCLE_MS_RANGE[0]}-{CYCLE_MS_RANGE[1]})")
+    ap.add_argument("--xcursor", choices=sorted(XCUR_PROFILES), default="lite",
+                    help="XCursor sizes: lite = 24-64 px (default), full = 16-96 px like the original")
+    ap.add_argument("--no-verify", action="store_true",
+                    help=f"build from a source other than {SOURCE_NAME} {SOURCE_VERSION} (skips the "
+                         "name, version, checksum and shape/name count checks; the per-frame "
+                         "recolouring checks and the alias checks still run)")
     a = ap.parse_args()
+    if not CYCLE_MS_RANGE[0] <= a.cycle_ms <= CYCLE_MS_RANGE[1]:
+        sys.exit(f"--cycle-ms must be within {CYCLE_MS_RANGE[0]}-{CYCLE_MS_RANGE[1]}")
 
+    problems = validate_source(a.source, verify=not a.no_verify)
+    if problems:
+        shown = "\n  ".join(problems[:20])
+        more = f"\n  ... and {len(problems) - 20} more" if len(problems) > 20 else ""
+        sys.exit(f"cannot build from {a.source}:\n  {shown}{more}")
     src_hypr = a.source / "hyprcursors"
     src_xcur = a.source / "cursors"
     shapes = sorted(p.stem for p in src_hypr.glob("*.hlc"))
-    if not shapes or not src_xcur.is_dir():
-        sys.exit(f"{a.source} is incomplete (needs hyprcursors/*.hlc and cursors/); "
-                 "re-clone the repository or pass --source")
+    xcur_sizes = XCUR_PROFILES[a.xcursor]
+    source_fields = manifest_fields(a.source / "manifest.hl")
     if not shutil.which("hyprcursor-util"):
         sys.exit("hyprcursor-util not found (package: hyprcursor)")
 
@@ -308,7 +431,7 @@ def main():
     (hypr_src / "manifest.hl").write_text(
         f"name = {THEME_NAME}\n"
         "description = Bibata Modern with a flowing rainbow body\n"
-        "version = 1.0\n"
+        f"version = {VERSION}\n"
         "cursors_directory = hyprcursors\n"
     )
 
@@ -316,7 +439,7 @@ def main():
     for name in shapes:
         x = src_xcur / name
         jobs.append((name, src_hypr / f"{name}.hlc", hypr_src / "hyprcursors", out / "cursors",
-                     x if x.is_file() and not x.is_symlink() else None, a.hypr_format))
+                     x if x.is_file() and not x.is_symlink() else None, a.hypr_format, a.cycle_ms, xcur_sizes))
     with ProcessPoolExecutor(max_workers=a.jobs) as pool:
         for name, axis, nh, nx in pool.map(build_shape, jobs):
             print(f"{name}: {nh} hyprcursor frames, {nx} xcursor frames, rainbow axis {axis}")
@@ -342,6 +465,15 @@ def main():
         "Inherits=Bibata-Modern-Ice,hicolor\n"
     )
     (out / "cursor.theme").write_text(f"[Icon Theme]\nName={THEME_NAME}\nInherits=Bibata-Modern-Ice\n")
+    (out / "BUILD-INFO").write_text(
+        f"version={VERSION}\n"
+        f"source={source_fields.get('name', '?')} {source_fields.get('version', '?')}\n"
+        f"source_verified={'no' if a.no_verify else 'yes'}\n"
+        f"hypr_format={a.hypr_format}\n"
+        f"xcursor={a.xcursor}\n"
+        f"xcursor_sizes={' '.join(map(str, xcur_sizes))}\n"
+        f"cycle_ms={a.cycle_ms}\n"
+    )
     # The theme is a modified Bibata (GPL-3.0): ship the licence and where it comes from.
     shutil.copy2(here / "LICENSE", out / "LICENSE")
     (out / "NOTICE").write_text(

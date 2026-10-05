@@ -42,7 +42,7 @@ draw = ImageDraw.Draw(sheet)
 for idx, name in enumerate(names):
     images = frames(theme / "cursors" / name, size)
     if not images:
-        sys.exit(f"{name} has no {size} px images; the XCursor sizes are listed in generate.py (XCUR_SIZES)")
+        sys.exit(f"{name} has no {size} px images; the built sizes are in {theme}/BUILD-INFO (xcursor_sizes)")
     r, c = divmod(idx, COLS)
     for p in range(PHASES):
         img = images[len(images) * p // PHASES]

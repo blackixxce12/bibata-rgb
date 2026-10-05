@@ -33,8 +33,19 @@ cd bibata-rgb
 
 `install.sh` собирает тему (несколько секунд), ставит её в `~/.local/share/icons/Bibata-RGB`,
 модуль рамок в `~/.config/hypr/config/rgb.lua` и переключатель `rgb-theme` в
-`~/.local/bin`. Если в системе нет Bibata-Modern-Ice, он ставит оригинал из `vendor/`:
-`rgb-theme off` возвращается именно к нему. Сам `install.sh` ничего не включает.
+`~/.local/bin`. Если в системе нет Bibata-Modern-Ice, он ставит оригинал из `vendor/`. Сам
+`install.sh` ничего не включает. При переустановке выбранные скорости, режим `spin` и
+вариант XCursor сохраняются; если RGB-курсор уже включён, `rgb-theme on` перечитает тему.
+
+XCursor-часть (для XWayland и GTK3) бывает двух вариантов:
+
+| | Размеры | На диске |
+|---|---|---|
+| `./install.sh --lite` (по умолчанию) | 24, 32, 40, 48, 64 px | ~54 МБ |
+| `./install.sh --full` | 16–96 px, как у оригинала | ~235 МБ |
+
+Hyprland и программы грузят только нужный размер, так что вариант влияет лишь на место на
+диске и на то, найдётся ли точный размер для необычных масштабов.
 
 Для сборки нужны `python-gobject`, `python-cairo`, `librsvg` и `hyprcursor` (первая строка
 выше; `--needed` пропускает уже установленные). На свежей CachyOS обычно не хватает
@@ -42,30 +53,62 @@ cd bibata-rgb
 `generate.py` или `vendor/` новее сборки (например, после `git pull`), `install.sh` соберёт
 тему заново.
 
-**Без сборки:** скачайте `Bibata-RGB.tar.xz` со страницы
+**Без сборки:** скачайте `Bibata-RGB.tar.xz` (или `Bibata-RGB-full.tar.xz`) со страницы
 [Releases](https://github.com/blackixxce12/bibata-rgb/releases), распакуйте его в `build/`
-и запустите `./install.sh`. Сборка тогда пропускается.
+и запустите `./install.sh` (для full-архива — `./install.sh --full`). Сборка тогда
+пропускается. Ключ `-m` важен: файлы получают время распаковки, иначе `install.sh` сочтёт
+сборку старше исходников и пересоберёт её.
 
 ```bash
-mkdir -p build && tar -xJf Bibata-RGB.tar.xz -C build
+mkdir -p build && tar -xJmf Bibata-RGB.tar.xz -C build
 ```
 
 ## Управление
 
 ```bash
-rgb-theme status            # что сейчас включено
-rgb-theme on                # RGB-курсор и RGB-рамки
-rgb-theme off               # вернуть Bibata-Modern-Ice и прежние рамки
-rgb-theme off cursor        # только курсор назад (рамки остаются RGB)
-rgb-theme off borders       # только рамки назад
+rgb-theme status              # что сейчас включено и что вернёт off
+rgb-theme on                  # RGB-курсор и RGB-рамки
+rgb-theme off                 # вернуть всё как было до on
+rgb-theme off cursor          # только курсор назад (рамки остаются RGB)
+rgb-theme off borders         # только рамки назад
 rgb-theme toggle [cursor|borders]
-rgb-theme spin loop         # рамки вращаются всё время (по умолчанию)
-rgb-theme spin focus        # один оборот при фокусе окна, потом покой (экономнее)
-rgb-theme spin off          # радуга стоит
+rgb-theme spin loop           # рамки вращаются всё время (по умолчанию)
+rgb-theme spin focus          # один оборот при фокусе окна, потом покой (экономнее)
+rgb-theme spin off            # радуга стоит
+rgb-theme speed               # текущие скорости
+rgb-theme speed cursor 1      # курсор: секунд на цикл радуги (0,3–20; по умолчанию 2,16)
+                              # (спиннер ожидания крутится быстрее или медленнее вместе с ней)
+rgb-theme speed borders 3     # рамки: секунд на оборот (0,3–10; по умолчанию 5)
+rgb-theme speed cursor default
+rgb-theme version
 ```
 
-`off` возвращает все изменённые файлы байт в байт, права файлов сохраняются. Перед правками
-скрипт проверяет, что тема установлена, а `hyprland.lua` и `rgb.lua` на месте. Если
+### Что вернёт off
+
+Первый `on` сохраняет то, что собирается изменить, в `~/.local/state/bibata-rgb/`: копии
+файлов, а для отсутствующих — сам факт, что их не было; значение gsettings (и было ли оно
+вообще задано); переменные `XCURSOR_THEME`/`HYPRCURSOR_THEME` окружения systemd. `off`
+возвращает ровно это и удаляет снимок. Если до `on` стояла, например, `MyCustomCursor`,
+после `off` снова будет `MyCustomCursor` — во всех файлах, в gsettings, в окружении и в
+самом Hyprland (темы `XCURSOR` и `HYPRCURSOR` восстанавливаются каждая своя).
+
+- Файл, который после `on` правили вручную, сохраняет эти правки; в нём возвращается только
+  строка темы курсора (для `hyprland.lua` — убирается только строка `require("config.rgb")`).
+  gsettings и переменные окружения возвращаются, только если там всё ещё `Bibata-RGB`.
+- Файл, которого до `on` не было, `off` не удаляет; если в нём стоит `Bibata-RGB`, эта
+  строка меняется на прежнюю тему.
+- Повторный `on` снимок не перезаписывает. Если же RGB уже убрали другим способом, снимок
+  считается устаревшим: `off` его просто удаляет, а следующий `on` делает новый.
+- Если `on` прервался на полпути, его снимок сохраняется: повторный `on` доделает работу, а
+  `off` вернёт состояние до него. Два одновременных запуска (например, двойное нажатие на
+  бинд с `toggle`) выполняются по очереди.
+- Переменную, которой до `on` не было в окружении D-Bus, убрать оттуда нельзя: она
+  останется до перезахода (это касается только программ, запускаемых через D-Bus).
+- Если RGB включили версией 1.0 (снимков тогда не было), `off` переключает на
+  Bibata-Modern-Ice, как раньше; следующий `on` уже сохранит снимок.
+
+Перед правками скрипт проверяет, что тема установлена, `hyprland.lua` и `rgb.lua` на
+месте, а папки с изменяемыми файлами доступны для записи; иначе он ничего не трогает. Если
 Hyprland недоступен, файлы всё равно переключаются, и изменения вступят в силу при
 следующем входе.
 
@@ -86,6 +129,7 @@ Hyprland недоступен, файлы всё равно переключаю
 | gsettings | `org.gnome.desktop.interface cursor-theme` |
 | окружение systemd/dbus и Hyprland | `XCURSOR_THEME`, `HYPRCURSOR_THEME` (на лету) |
 | `~/.config/hypr/hyprland.lua` | строка `require("config.rgb")` после `require("config.workspaces")` |
+| `~/.local/state/bibata-rgb/` | снимок состояния до `on` (удаляется при `off`) |
 
 Отсутствующие файлы пропускаются; если в `~/.config/uwsm/env` нет строки
 `export HYPRCURSOR_THEME=...`, скрипт предупредит, что после перезахода тема не сохранится.
@@ -93,29 +137,47 @@ Hyprland недоступен, файлы всё равно переключаю
 
 ## Настройка
 
-Цвета, скорость вращения (`speed = 50` — это 5 с; меньше — быстрее) и прозрачность
-неактивных рамок (`"66"`) задаются в `hypr/rgb.lua`; после правки запустите `./install.sh`.
-Правки, внесённые прямо в установленный `~/.config/hypr/config/rgb.lua`, `install.sh`
-сохраняет в `rgb.lua.bak-<дата>` и заменяет файл; режим `spin` переносится.
+Скорость меняется командой `rgb-theme speed` (см. выше). Для курсора она переписывает
+задержки кадров в установленной теме и сразу перечитывает её; кадры те же, поэтому
+переливание остаётся таким же плавным, только быстрее или медленнее. Спиннер ожидания
+крутится вместе с радугой. Чем короче цикл, тем чаще Hyprland меняет кадр курсора: при
+0,3 с это ~120 раз в секунду (у спиннера ~180) вместо ~17 при 2,16 с.
+
+Цвета и прозрачность неактивных рамок (`"66"`) задаются в `hypr/rgb.lua`; после правки
+запустите `./install.sh`. Правки, внесённые прямо в установленный
+`~/.config/hypr/config/rgb.lua`, `install.sh` сохраняет в `rgb.lua.bak-<дата>` и заменяет
+файл; `SPIN` и `TURN` (режим и скорость) переносятся.
 
 У заблокированных групп окон тёплая радуга. Полоски вкладок групп Hyprland рисует одним
 цветом: фиолетовый, у заблокированных — оранжевый.
 
-Курсор: палитра (`RAINBOW`), длина цикла (`CYCLE_MS`), число кадров и размеры XCursor —
-константы в начале `generate.py`. После правки: `python3 generate.py && ./install.sh`,
-затем `rgb-theme on`, чтобы Hyprland перечитал тему.
+Курсор: палитра (`RAINBOW`) и число кадров — константы в начале `generate.py`. После
+правки: `python3 generate.py && ./install.sh`, затем `rgb-theme on`, чтобы Hyprland
+перечитал тему. Для уже установленной темы скорость задаёт `rgb-theme speed cursor`, а
+размеры XCursor — `./install.sh --lite|--full`; опции `generate.py --cycle-ms` и
+`--xcursor` нужны для первой установки или для своих архивов (`install.sh` сохраняет
+установленную скорость, только если сборка сделана со скоростью по умолчанию).
 
 ## Удаление
 
 ```bash
 rgb-theme off
 rm ~/.config/hypr/config/rgb.lua ~/.local/bin/rgb-theme
-rm -r ~/.local/share/icons/Bibata-RGB
+rm -r ~/.local/share/icons/Bibata-RGB ~/.local/state/bibata-rgb
 ```
 
 ## Как это устроено
 
-- `generate.py` берёт SVG-исходники Bibata-Modern-Ice из `vendor/` и заменяет белый цвет
+- `generate.py` написан под конкретный исходник — Bibata-Modern-Ice v2.0.6 из `vendor/`:
+  его правила перекраски опираются на разметку именно этих SVG. Перед сборкой он проверяет
+  имя и версию в `manifest.hl`, контрольную сумму дерева `vendor/Bibata-Modern-Ice` (пути,
+  содержимое, симлинки) и число форм и имён (56 и 145); затем — что у каждой формы есть файл
+  XCursor, все алиасы XCursor указывают на файлы, в каждом кадре срабатывают все правила для
+  этой формы, а у спиннеров — все 4 лопасти. При любом расхождении сборка останавливается с
+  перечнем проблем, а не выдаёт тихо неперекрашенную тему. `--no-verify` позволяет собрать из
+  другого исходника: он пропускает проверки имени, версии, контрольной суммы и числа форм,
+  остальные выполняются.
+- Затем `generate.py` берёт SVG-исходники Bibata-Modern-Ice из `vendor/` и заменяет белый цвет
   тела повторяющимся радужным градиентом, который в каждом кадре сдвигается на долю
   периода. Направление градиента выбирается по оси формы: у карандаша и диагональных стрелок
   радуга идёт вдоль них. Особые формы:
@@ -124,12 +186,14 @@ rm -r ~/.local/share/icons/Bibata-RGB
   - у угловых курсоров изменения размера сектор окрашен радугой со сдвигом на полпериода,
     чтобы уголок-указатель выделялся;
   - лопасти спиннера ожидания — чередующиеся светлые и тёмные полупрозрачные.
-- hyprcursor: SVG-кадры, 36 кадров × 60 мс, у спиннеров 54 × 40 мс. SVG рисуются ровно в том
+- hyprcursor: SVG-кадры, 36 кадров на цикл (у спиннеров 54); при скорости по умолчанию это
+  60 и 40 мс на кадр. SVG рисуются ровно в том
   размере, который просит Hyprland (24 × наибольший масштаб мониторов), поэтому курсор
   корректен при любом масштабе. Проверено на 20–72 px против оригинала: покрытие и хотспоты
   совпадают у всех 145 имён.
-- XCursor (для XWayland и GTK3): размеры 24/32/40/48/64, 24 кадра × 90 мс (спиннеры 54 × 40),
-  ~53 МБ на диске. Запросы за пределами 24–64 получат ближайший размер (оригинал: 16–96).
+- XCursor (для XWayland и GTK3): 24 кадра на цикл (спиннеры 54); размеры — по варианту lite
+  или full (см. «Установка»). В lite запросы за пределами 24–64 получат ближайший размер.
+- В теме лежит `BUILD-INFO`: версия, исходник, вариант XCursor и текущая длина цикла.
 
 ### Цена
 
@@ -188,9 +252,18 @@ git clone https://github.com/blackixxce12/bibata-rgb.git && cd bibata-rgb
 rgb-theme spin focus         # borders turn once on focus instead of all the time (cheaper)
 ```
 
+`rgb-theme off` restores exactly what was there before the first `on` (files, whether they
+existed, gsettings, the session environment), saved in `~/.local/state/bibata-rgb`; files
+edited by hand in between keep those edits. `rgb-theme speed cursor <s>` and
+`rgb-theme speed borders <s>` set the animation speeds; `./install.sh --full` adds the
+16–96 px XCursor sizes (~235 MB instead of ~54 MB). The generator checks that
+`vendor/Bibata-Modern-Ice` is exactly Bibata-Modern-Ice v2.0.6 (name, version, tree checksum)
+and that every recolouring rule matches before it builds.
+
 Needs Hyprland with a Lua config (tested on 0.56.2) and a uwsm session (the CachyOS Hyprland
-layout); building needs python-gobject, python-cairo, librsvg and hyprcursor. A prebuilt
-theme (Bibata-RGB.tar.xz, unpack into build/) is attached to the releases. The theme is generated from the GPL-3.0 Bibata sources
+layout); building needs python-gobject, python-cairo, librsvg and hyprcursor. Prebuilt themes
+(Bibata-RGB.tar.xz, Bibata-RGB-full.tar.xz; unpack with `tar -xJmf ... -C build`) are attached
+to the releases. The theme is generated from the GPL-3.0 Bibata sources
 kept in `vendor/`. The turning borders keep Hyprland redrawing at the monitor's refresh rate
 (about 4–6 % of a CPU core in the author's measurements), and loading the animated theme
 takes about 0.5 s.

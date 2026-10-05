@@ -1,9 +1,10 @@
 -- RGB look: rainbow window borders.
 -- `rgb-theme on|off borders` adds/removes the line require("config.rgb") in hyprland.lua;
--- decorations.lua keeps the original colours. `rgb-theme spin loop|focus|off` sets SPIN.
+-- decorations.lua keeps the original colours. `rgb-theme spin loop|focus|off` sets SPIN,
+-- `rgb-theme speed borders <seconds>` sets TURN.
 
 -- How the rainbow moves:
---   "loop"   turns all the time, one turn every 5 s. While a turning border is visible,
+--   "loop"   turns all the time, one turn every TURN seconds. While a turning border is visible,
 --            Hyprland redraws the screen at its refresh rate (e.g. 165 Hz) instead of idling, and
 --            its animation timer wakes ~1000 times a second (measured ~4-6 % of a CPU core).
 --            Windows opened while the borders did not move (borders off, or spin off) keep
@@ -11,6 +12,8 @@
 --   "focus"  turns once whenever a window gets focus, then rests (no constant redraw).
 --   "off"    stands still.
 local SPIN = "loop"
+-- Seconds for one full turn in "loop" mode (0.3-10; Hyprland caps the speed at 10 s)
+local TURN = 5
 
 local RAINBOW = {
     "rgba(ff1744ff)", "rgba(ff9100ff)", "rgba(ffea00ff)", "rgba(00e676ff)",
@@ -56,7 +59,7 @@ hl.config({
 
 -- speed is in 100 ms units: 50 = one turn in 5 s
 if SPIN == "loop" then
-    hl.animation({ leaf = "borderangle", enabled = true, speed = 50, bezier = "linear", style = "loop" })
+    hl.animation({ leaf = "borderangle", enabled = true, speed = TURN * 10, bezier = "linear", style = "loop" })
 elseif SPIN == "focus" then
     hl.animation({ leaf = "borderangle", enabled = true, speed = 15, bezier = "easeInOutCubic", style = "once" })
 end
